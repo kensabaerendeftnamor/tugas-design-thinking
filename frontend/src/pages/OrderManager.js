@@ -11,9 +11,11 @@ import api from '../services/api';
 import { TABLE_PAGINATION_OPTIONS } from '../utils/constants';
 import { formatDateTime } from '../utils/helpers';
 
+
 const OrderManager = () => {
   const [orders, setOrders] = useState([]);
   const [menus, setMenus] = useState([]);
+  const [ingredients, setIngredients] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
@@ -32,6 +34,7 @@ const OrderManager = () => {
   useEffect(() => {
     fetchOrders();
     fetchMenus();
+    fetchIngredients();
   }, [page, rowsPerPage, searchTerm, startDate, endDate]);
 
   const fetchOrders = async () => {
@@ -65,6 +68,15 @@ const OrderManager = () => {
     }
   };
 
+  const fetchIngredients = async () => {
+    try {
+      const response = await api.get('/ingredients?limit=1000');
+      setIngredients(response.data.data);
+    } catch (error) {
+      console.error('Error fetching ingredients:', error);
+    }
+  };
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
@@ -93,25 +105,6 @@ const OrderManager = () => {
     }
   };
 
-  // Helper function untuk mendapatkan informasi bahan yang digunakan
-  const getIngredientDisplayInfo = (ingredientUsed) => {
-    // Prioritaskan data dari ingredientId yang terpopulate
-    if (ingredientUsed.ingredientId && typeof ingredientUsed.ingredientId === 'object') {
-      return {
-        name: ingredientUsed.ingredientId.name || 'Bahan tidak ditemukan',
-        unit: ingredientUsed.ingredientId.unit || '',
-        quantity: ingredientUsed.quantityUsed || 0
-      };
-    }
-    
-    // Fallback ke data denormalized
-    return {
-      name: ingredientUsed.ingredientName || 'Bahan tidak ditemukan',
-      unit: ingredientUsed.unit || '',
-      quantity: ingredientUsed.quantityUsed || 0
-    };
-  };
-
   const getStatusColor = (status) => {
     switch (status) {
       case 'completed': return 'success';
@@ -127,6 +120,110 @@ const OrderManager = () => {
       case 'pending': return 'Menunggu';
       case 'cancelled': return 'Dibatalkan';
       default: return status;
+    }
+  };
+
+  // FUNGSI YANG DIPERBAIKI: Mencari nama bahan dari daftar ingredients
+  const getIngredientDisplayInfo = (ingredient) => {
+    // Coba semua kemungkinan sumber untuk nama bahan
+    let ingredientName = '';
+    let unit = '';
+
+    // 1. Cek apakah ada ingredientName langsung
+    if (ingredient.ingredientName) {
+      ingredientName = ingredient.ingredientName;
+      unit = ingredient.unit || '';
+    } 
+    // 2. Cek apakah ingredientId adalah object yang terpopulate
+    else if (ingredient.ingredientId && typeof ingredient.ingredientId === 'object') {
+      ingredientName = ingredient.ingredientId.name || '';
+      unit = ingredient.ingredientId.unit || '';
+    }
+    // 3. Cari dari daftar ingredients berdasarkan ingredientId
+    else if (ingredient.ingredientId) {
+      const foundIngredient = ingredients.find(ing => ing._id === ingredient.ingredientId);
+      if (foundIngredient) {
+        ingredientName = foundIngredient.name;
+        unit = foundIngredient.unit;
+      }
+    }
+
+    // 4. Jika masih tidak ditemukan, gunakan fallback
+    if (!ingredientName) {
+      ingredientName = 'Bahan tidak diketahui';
+    }
+    if (!unit) {
+      unit = 'unit';
+    }
+
+    return { ingredientName, unit };
+  };
+
+  // FUNGSI UNTUK MIGRASI DATA PESANAN LAMA (opsional)
+  const migrateOldOrders = async () => {
+    if (window.confirm('Migrasi data pesanan lama? Ini akan memperbaiki tampilan bahan yang digunakan.')) {
+      try {
+        setLoading(true);
+        
+        // Ambil semua pesanan
+        const allOrdersResponse = await api.get('/orders?limit=1000');
+        const allOrders = allOrdersResponse.data.data;
+        
+        let migratedCount = 0;
+        
+        for (const order of allOrders) {
+          const needsMigration = order.ingredientsUsed.some(ing => 
+            !ing.ingredientName || !ing.unit
+          );
+          
+          if (needsMigration) {
+            const updatedIngredientsUsed = await Promise.all(
+              order.ingredientsUsed.map(async (ing) => {
+                if (ing.ingredientName && ing.unit) {
+                  return ing; // Sudah benar, tidak perlu diubah
+                }
+                
+                // Cari informasi bahan
+                let ingredientName = 'Bahan tidak diketahui';
+                let unit = 'unit';
+                
+                if (ing.ingredientId) {
+                  try {
+                    const ingredientResponse = await api.get(`/ingredients/${ing.ingredientId}`);
+                    if (ingredientResponse.data.success) {
+                      ingredientName = ingredientResponse.data.data.name;
+                      unit = ingredientResponse.data.data.unit;
+                    }
+                  } catch (error) {
+                    console.warn(`Tidak dapat menemukan ingredient dengan ID: ${ing.ingredientId}`);
+                  }
+                }
+                
+                return {
+                  ...ing,
+                  ingredientName,
+                  unit
+                };
+              })
+            );
+            
+            // Update pesanan dengan data yang sudah dimigrasi
+            await api.put(`/orders/${order._id}`, {
+              ingredientsUsed: updatedIngredientsUsed
+            });
+            
+            migratedCount++;
+          }
+        }
+        
+        setSuccess(`Berhasil memigrasi ${migratedCount} pesanan lama`);
+        fetchOrders();
+        
+      } catch (error) {
+        setError('Gagal memigrasi data pesanan: ' + error.message);
+      } finally {
+        setLoading(false);
+      }
     }
   };
 
@@ -161,6 +258,20 @@ const OrderManager = () => {
           >
             Refresh
           </Button>
+          {/* Tombol migrasi untuk memperbaiki data lama */}
+          {orders.some(order => 
+            order.ingredientsUsed.some(ing => !ing.ingredientName)
+          ) && (
+            <Button
+              variant="outlined"
+              color="warning"
+              onClick={migrateOldOrders}
+              sx={{ mr: 1 }}
+              disabled={loading}
+            >
+              {loading ? 'Memigrasi...' : 'Perbaiki Data Lama'}
+            </Button>
+          )}
           <Button
             variant="contained"
             startIcon={<Add />}
@@ -284,13 +395,11 @@ const OrderManager = () => {
                       <TableCell>
                         <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, maxWidth: 300 }}>
                           {order.ingredientsUsed.slice(0, 3).map((ing, index) => {
-                            const ingredientInfo = getIngredientDisplayInfo(ing);
-                            const displayText = `${ingredientInfo.name} -${ingredientInfo.quantity} ${ingredientInfo.unit}`;
-                            
+                            const { ingredientName, unit } = getIngredientDisplayInfo(ing);
                             return (
                               <Chip
                                 key={index}
-                                label={displayText}
+                                label={`${ingredientName} -${ing.quantityUsed} ${unit}`}
                                 size="small"
                                 variant="outlined"
                                 color="error"
